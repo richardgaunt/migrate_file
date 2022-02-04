@@ -10,8 +10,8 @@ use Drupal\migrate\MigrateSkipProcessException;
 use Drupal\migrate\Plugin\migrate\process\FileCopy;
 use Drupal\migrate\Plugin\MigrateProcessInterface;
 use Drupal\migrate\Row;
+use Drupal\file\FileInterface;
 use Drupal\file\Entity\File;
-use Symfony\Component\DependencyInjection\ContainerInterface;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\ServerException;
@@ -46,10 +46,12 @@ use Drupal\Core\StreamWrapper\StreamWrapperManager;
  * - move: Boolean, if TRUE, move the file, otherwise copy the file. Only
  *   applies if the source file is local. If the source file is remote it will
  *   be copied. Defaults to FALSE.
- * - rename: Boolean, if TRUE, rename the file by appending a number
- *   until the name is unique. Defaults to FALSE.
- * - reuse: Boolean, if TRUE, reuse the current file in its existing
- *   location rather than move/copy/rename the file. Defaults to FALSE.
+ * - file_exists: (optional) Replace behavior when the destination file already
+ *   exists:
+ *   - 'replace' - (default) Replace the existing file.
+ *   - 'rename' - Append _{incrementing number} until the filename is
+ *       unique.
+ *   - 'use existing' - Do nothing and return FALSE.
  * - skip_on_missing_source: (optional) Boolean, if TRUE, this field will be
  *   skipped if the source file is missing (either not available locally or 404
  *   if it's a remote file). Otherwise, the row will fail with an error. Note
@@ -218,43 +220,34 @@ class FileImport extends FileCopy {
     }
     $final_destination = '';
 
-    // If we're in re-use mode, reuse the file if it exists.
-    if ($this->getOverwriteMode() == FileSystemInterface::EXISTS_ERROR && $this->isLocalUri($destination) && is_file($destination)) {
-      // Look for a file entity with the destination uri.
-      if ($files = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $destination])) {
-        // Grab the first file entity with a matching uri.
-        // @todo: Any logic for preference when there are multiple?
-        $file = reset($files);
-        // Set to permanent if the file in the database is set to temporary.
-        // This means that the file was probably set to be removed during
-        // garbage collection, which we don't want to happen anymore since we're
-        // using it.
-        if ($file->isTemporary()) {
-          $file->setPermanent();
-          $file->save();
-        }
-
+    //
+    // If file_exists behaviour is FileSystemInterface::EXISTS_ERROR, it means
+    // the user has selected to "use exsiting". So if the file exists in the
+    // filesystem, we lookup the corresponding File Entity and return it. If
+    // there isn't a corresponding File Entity one will be created. This could
+    // happen, for example, if a file has been manually moved to the destination
+    // outside of Drupal.
+    //
+    if ($this->configuration['file_exists'] == FileSystemInterface::EXISTS_ERROR && $this->isLocalUri($destination) && is_file($destination)) {
+      // Look for an existing file entity with the destination uri.
+      if ($file = $this->getExistingFileEntity($destination)) {
         return $id_only ? $file->id() : ['target_id' => $file->id()];
       }
       else {
+        // Otherwise we'll be creating a new one further down.
         $final_destination = $destination;
       }
     }
     else {
+      //
       // The parent method will take care of our download/move/copy/rename.
-      // We just need to final destination to create the file object.
+      // We just need the final destination to create the file object.
+      //
       try {
         $final_destination = parent::transform([$source, $destination], $migrate_executable, $row, $destination_property);
-
         // If this was a replace, there should be an existing file entity for it
         // And if so, we return it. Otherwise, one will be created further down.
-        if ($files = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $final_destination])) {
-          $file = reset($files);
-          if ($file->isTemporary()) {
-            $file->setPermanent();
-            $file->save();
-          }
-
+        if ($file = $this->getExistingFileEntity($final_destination)) {
           return $id_only ? $file->id() : ['target_id' => $file->id()];
         }
       }
@@ -276,7 +269,7 @@ class FileImport extends FileCopy {
       $file = File::create([
         'uri' => $final_destination,
         'uid' => $uid,
-        'status' => FILE_STATUS_PERMANENT,
+        'status' => FileInterface::STATUS_PERMANENT,
       ]);
       $file->save();
       return $id_only ? $file->id() : ['target_id' => $file->id()];
@@ -365,6 +358,39 @@ class FileImport extends FileCopy {
       $filepath = $destination;
     }
     return $filepath;
+  }
+
+  /**
+   * Get an existing file entity for a given URI.
+   *
+   * @param string $destination
+   *   The destination URI.
+   *
+   * @param boolean $set_permanent
+   *   Whether or not to set the file as permanent if it is currently temporary.
+   *
+   * @return \Drupal\file\FileInterface
+   *   The matching file entity or NULL if no entity exists.
+   */
+  protected function getExistingFileEntity($destination, $set_permanent = TRUE) {
+    if ($files = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $destination])) {
+      // Grab the first file entity with a matching uri.
+      // @todo: Any logic for preference when there are multiple?
+      $file = reset($files);
+
+      // Set to permanent if the file in the database is set to temporary.
+      // This means that the file was probably set to be removed during
+      // garbage collection, which we don't want to happen anymore since we're
+      // using it.
+      if ($set_permanent && !$file->isTemporary()) {
+        $file->setPermanent();
+        $file->save();
+      }
+
+      return $file;
+    }
+
+    return NULL;
   }
 
   /**
